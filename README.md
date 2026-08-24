@@ -6,7 +6,7 @@ Track A: Fictional Domain Packet
 
 ## What I Built
 
-A stdlib Python CLI that prints a one-page weekly briefing: data-quality flags, a cleaned workflow comparison, a before/after on the Aug 4 prompt change, and one recommended next action.
+A stdlib Python CLI that prints a pasteable weekly briefing, then the tables behind it: data-trust flags, a cleaned workflow snapshot, a by-source cut, a prompt-change split, and the Aug 7 policy-shock row.
 
 ```bash
 python3 health_check.py
