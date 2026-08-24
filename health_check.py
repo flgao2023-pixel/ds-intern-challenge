@@ -1,368 +1,469 @@
 #!/usr/bin/env python3
 """SignalDesk weekly health check.
 
-Prints a one-page briefing a product teammate can paste into Slack, then
-the tables behind it.
-
-Stdlib only. Usage:
-    python3 health_check.py
-    python3 health_check.py path/to/product_usage_events.csv
+One job: help a product teammate decide what is working, what looks
+untrustworthy, and what to investigate before a broader rollout.
 """
 
 from __future__ import annotations
 
-import csv
-import math
-import sys
-import textwrap
+import argparse
 from pathlib import Path
-from statistics import median
 
-DEFAULT_CSV = Path(__file__).resolve().parent / "sample-data" / "product_usage_events.csv"
-PROMPT_START = "2026-08-04"
-POLICY_NOTE = "review policy changed mid-day"
-DEMO_NOTE = "traffic spike from demo account"
-SMALL_SAMPLE_NOTE = "small sample"
-PROMPT_NOTE = "new prompt version started"
-NA_TOKENS = {"n/a", "na", "null"}
+import pandas as pd
 
-EXPECTED = [
-    ("Sales", "Lead summary", "email"),
-    ("Sales", "Lead summary", "manual"),
-    ("Support", "Reply draft", "queue"),
-    ("Support", "Reply draft", "manual"),
-    ("Product", "Feedback clustering", "csv upload"),
-    ("Product", "Feedback clustering", "manual"),
+DEFAULT_DATA = Path(__file__).parent / "sample-data" / "product_usage_events.csv"
+
+# Fallback if notes do not name a start date.
+PROMPT_CHANGE_DATE = pd.Timestamp("2026-08-04")
+
+COUNT_COLS = [
+    "sessions",
+    "completed",
+    "accepted_output",
+    "flagged_for_review",
+    "avg_minutes_saved",
+    "user_rating",
 ]
 
 
-def parse_int(value: str) -> int | None:
-    value = (value or "").strip()
-    return int(value) if value else None
+def load_raw(path: Path) -> pd.DataFrame:
+    # Keep literal "n/a" so we can flag it. Default read_csv would swallow it.
+    df = pd.read_csv(path, keep_default_na=False, na_values=[""])
+    df["date"] = pd.to_datetime(df["date"])
+    return df
 
 
-def parse_float(value: str) -> float | None:
-    value = (value or "").strip()
-    if value.lower() in {"", *NA_TOKENS}:
-        return None
-    return float(value)
+def prompt_change_date(df: pd.DataFrame) -> pd.Timestamp:
+    mask = df["notes"].astype(str).str.contains("new prompt version", case=False, na=False)
+    if mask.any():
+        return pd.Timestamp(df.loc[mask, "date"].min())
+    return PROMPT_CHANGE_DATE
 
 
-def round_half_up(value: float, ndigits: int = 2) -> float:
-    scale = 10**ndigits
-    return math.floor(value * scale + 0.5) / scale
+def post_change_slice(df: pd.DataFrame, change_date: pd.Timestamp) -> pd.DataFrame:
+    """Rows on/after the prompt change, minus only the policy-shock row."""
+    return df[(df["date"] >= change_date) & ~df["policy_shock"]].copy()
 
 
-def load_rows(path: Path) -> list[dict]:
-    rows = []
-    with path.open(newline="") as handle:
-        for raw in csv.DictReader(handle):
-            conf_raw = (raw["median_confidence"] or "").strip()
-            rows.append(
-                {
-                    "date": raw["date"].strip(),
-                    "team_raw": raw["team"].strip(),
-                    "team": raw["team"].strip().title(),
-                    "workflow": raw["workflow"].strip(),
-                    "source": raw["source"].strip(),
-                    "sessions": parse_int(raw["sessions"]),
-                    "completed": parse_int(raw["completed"]),
-                    "accepted": parse_int(raw["accepted_output"]),
-                    "flagged": parse_int(raw["flagged_for_review"]),
-                    "minutes": parse_float(raw["avg_minutes_saved"]),
-                    "confidence": parse_float(raw["median_confidence"]),
-                    "confidence_raw": conf_raw,
-                    "rating": parse_float(raw["user_rating"]),
-                    "notes": (raw.get("notes") or "").strip(),
-                }
+def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Normalize messy fields.
+
+    Returns (cleaned_frame, quality_flags, context_flags). Quality flags are
+    broken records; context flags are valid records that change how the
+    numbers should be read (policy change, demo traffic, small samples).
+    """
+    quality: list[str] = []
+    context: list[str] = []
+    out = df.copy()
+
+    conf_raw = out["median_confidence"].astype(str).str.strip()
+    n_na_text = int(conf_raw.str.lower().isin({"n/a", "na", "none"}).sum())
+    if n_na_text:
+        quality.append(
+            f"{n_na_text} row(s) store median_confidence as the text 'n/a' "
+            "(not a real missing value). Coerced to missing; the row is "
+            "kept and confidence medians ignore it."
+        )
+    out["median_confidence"] = pd.to_numeric(out["median_confidence"], errors="coerce")
+    for col in COUNT_COLS:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    missing_rating = int(out["user_rating"].isna().sum())
+    if missing_rating:
+        quality.append(
+            f"{missing_rating} row(s) are missing user_rating. Kept; "
+            "rating means use available rows only."
+        )
+
+    mixed_case = sorted(
+        {
+            t
+            for t in out["team"].unique()
+            if t != t.title() and t.title() in set(out["team"])
+        }
+    )
+    if mixed_case:
+        quality.append(
+            f"Team name casing is inconsistent ({', '.join(repr(x) for x in mixed_case)} "
+            "vs title case). Normalized to title case."
+        )
+    out["team"] = out["team"].str.title()
+
+    # Export "duplicates" may differ only in the notes field.
+    key_cols = ["date", "team", "workflow", "source", *COUNT_COLS]
+    near_dup = out.duplicated(subset=key_cols, keep="first")
+    n_near = int(near_dup.sum())
+    if n_near:
+        quality.append(
+            f"{n_near} near-duplicate export row(s) dropped (same date / team / "
+            "workflow / source / counts, different notes). Exact-row "
+            "duplicated() would have missed these."
+        )
+    out = out.loc[~near_dup].copy()
+
+    demo_mask = out["notes"].str.contains("demo account", case=False, na=False)
+    n_demo = int(demo_mask.sum())
+    if n_demo:
+        demo = out.loc[demo_mask].iloc[0]
+        context.append(
+            f"{n_demo} demo-account spike row excluded from health metrics "
+            f"({demo['date'].date()} {demo['workflow']} / {demo['source']}: "
+            f"{int(demo['sessions'])} sessions, confidence {demo['median_confidence']}, "
+            f"rating {demo['user_rating']})."
+        )
+    out["exclude_from_metrics"] = demo_mask
+
+    policy_mask = out["notes"].str.contains("review policy changed", case=False, na=False)
+    n_policy = int(policy_mask.sum())
+    if n_policy:
+        row = out.loc[policy_mask].iloc[0]
+        context.append(
+            f"{n_policy} mid-day review-policy shock "
+            f"({row['date'].date()} {row['workflow']} / {row['source']}: "
+            f"accept {int(row['accepted_output'])}/{int(row['completed'])} completed, "
+            f"{int(row['flagged_for_review'])} flagged). Keep visible, do not treat as "
+            "a normal quality day."
+        )
+    out["policy_shock"] = policy_mask
+
+    change_date = prompt_change_date(out)
+    prompt_mask = out["notes"].str.contains("new prompt version", case=False, na=False)
+    if prompt_mask.any():
+        context.append(
+            f"New prompt version starts {change_date.date()} "
+            f"({int(prompt_mask.sum())} annotated rows). Used as the "
+            "pre/post split date in recommendation 2."
+        )
+
+    expected = (
+        out.groupby(["team", "workflow", "source"], dropna=False)
+        .size()
+        .index
+    )
+    missing_days: list[str] = []
+    for d in sorted(out["date"].unique()):
+        have = set(
+            map(
+                tuple,
+                out.loc[out["date"] == d, ["team", "workflow", "source"]].to_numpy(),
             )
-    return rows
-
-
-def drop_near_duplicates(rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Keep the first row when date/team/workflow/source/counts match."""
-    seen: set[tuple] = set()
-    kept = []
-    dropped = []
-    for row in rows:
-        key = (
-            row["date"],
-            row["team"],
-            row["workflow"],
-            row["source"],
-            row["sessions"],
-            row["completed"],
-            row["accepted"],
-            row["flagged"],
         )
-        if key in seen:
-            dropped.append(row)
-            continue
-        seen.add(key)
-        kept.append(row)
-    return kept, dropped
+        for combo in expected:
+            if combo not in have:
+                missing_days.append(f"{pd.Timestamp(d).date()} {' / '.join(map(str, combo))}")
+    if missing_days:
+        context.append(
+            "Incomplete daily coverage (combo present in the export overall, "
+            f"missing on that day): {'; '.join(missing_days)}. Nothing "
+            "dropped; day totals for those dates undercount."
+        )
+
+    small = out["notes"].str.contains("small sample", case=False, na=False)
+    if small.any():
+        context.append(
+            f"{int(small.sum())} row(s) are labeled small sample; rates may "
+            "be unstable. Kept in aggregates for completeness, but not used "
+            "as standalone evidence for workflow rankings."
+        )
+
+    return out, quality, context
 
 
-def mean_unweighted(values: list[float | None]) -> float | None:
-    present = [value for value in values if value is not None]
-    if not present:
-        return None
-    return sum(present) / len(present)
+def add_rates(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["completion_rate"] = out["completed"] / out["sessions"]
+    out["accept_rate"] = out["accepted_output"] / out["completed"]
+    out["flag_rate"] = out["flagged_for_review"] / out["completed"]
+    return out
 
 
-def median_present(values: list[float | None]) -> float | None:
-    present = [value for value in values if value is not None]
-    if not present:
-        return None
-    return float(median(present))
+def weighted_rate(df: pd.DataFrame, num: str, den: str) -> float:
+    d = df[den].sum()
+    if d == 0:
+        return float("nan")
+    return float(df[num].sum() / d)
 
 
-def summarize(rows: list[dict]) -> dict:
-    sessions = sum(row["sessions"] or 0 for row in rows)
-    completed = sum(row["completed"] or 0 for row in rows)
-    accepted = sum(row["accepted"] or 0 for row in rows)
-    flagged = sum(row["flagged"] or 0 for row in rows)
-    return {
-        "rows": len(rows),
-        "sessions": sessions,
-        "completed": completed,
-        "accepted": accepted,
-        "flagged": flagged,
-        "completion": completed / sessions if sessions else None,
-        "accept": accepted / completed if completed else None,
-        "flag": flagged / completed if completed else None,
-        "min_unw": mean_unweighted([row["minutes"] for row in rows]),
-        "conf": median_present([row["confidence"] for row in rows]),
-        "rtg_unw": mean_unweighted([row["rating"] for row in rows]),
-    }
+def summarize(df: pd.DataFrame, group: str) -> pd.DataFrame:
+    rows = []
+    for key, g in df.groupby(group, sort=True):
+        rows.append(
+            {
+                group: key,
+                "sessions": int(g["sessions"].sum()),
+                "completed": int(g["completed"].sum()),
+                "accepted": int(g["accepted_output"].sum()),
+                "flagged": int(g["flagged_for_review"].sum()),
+                "completion_rate": weighted_rate(g, "completed", "sessions"),
+                "accept_rate": weighted_rate(g, "accepted_output", "completed"),
+                "flag_rate": weighted_rate(g, "flagged_for_review", "completed"),
+                # Unweighted mean of daily rows — not a volume-weighted total.
+                "avg_minutes_saved": g["avg_minutes_saved"].mean(),
+                "median_confidence": g["median_confidence"].median(),
+                "user_rating": g["user_rating"].mean(),
+                "days": int(g["date"].nunique()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-def pct(value: float | None) -> str:
-    return f"{100 * value:.1f}%" if value is not None else "n/a"
+def fmt_pct(x: float) -> str:
+    if pd.isna(x):
+        return "  n/a"
+    return f"{100 * x:5.1f}%"
 
 
-def pp_delta(after: float | None, before: float | None) -> str:
-    if after is None or before is None:
+def fmt_num(x: float, digits: int = 2) -> str:
+    if pd.isna(x):
         return "n/a"
-    return f"{100 * (after - before):+.1f} pp"
+    return f"{x:.{digits}f}"
 
 
-def wrap(text: str) -> str:
-    return textwrap.fill(text, width=78, break_long_words=False, break_on_hyphens=False)
+def block_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Small indented table meant to sit under the recommendation it supports."""
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+
+    def line(cells: list[str]) -> str:
+        parts = [
+            c.ljust(w) if i == 0 else c.rjust(w)
+            for i, (c, w) in enumerate(zip(cells, widths))
+        ]
+        return ("   " + "  ".join(parts)).rstrip()
+
+    rule = "   " + "-" * (sum(widths) + 2 * (len(widths) - 1))
+    return "\n".join([line(headers), rule, *[line(r) for r in rows]])
 
 
-def fmt_num(value: float | None, digits: int) -> str:
-    if value is None:
+def period_label(df: pd.DataFrame) -> str:
+    if df.empty:
         return "n/a"
-    return f"{round_half_up(value, digits):.{digits}f}"
+    return f"{df['date'].min().date()} to {df['date'].max().date()}"
 
 
-def table_row(name: str, stats: dict) -> str:
-    return (
-        f"{name:<22} {stats['sessions']:>4} {stats['completed']:>4} "
-        f"{stats['accepted']:>3} {stats['flagged']:>3} "
-        f"{pct(stats['completion']):>8} {pct(stats['accept']):>7} {pct(stats['flag']):>7} "
-        f"{fmt_num(stats['min_unw'], 2):>7} {fmt_num(stats['conf'], 2):>5} "
-        f"{fmt_num(stats['rtg_unw'], 2):>7}"
-    )
+def _row(summary: pd.DataFrame, workflow: str):
+    hit = summary.loc[summary["workflow"] == workflow]
+    if hit.empty:
+        return None
+    return hit.iloc[0]
 
 
-TABLE_HEADER = (
-    f"{'name':<22} {'sess':>4} {'comp':>4} {'acc':>3} {'flg':>3} "
-    f"{'complete':>8} {'accept':>7} {'flag':>7} {'min_unw':>7} {'conf':>5} {'rtg_unw':>7}"
-)
+def build_recommendation(clean_df: pd.DataFrame) -> list[str]:
+    usable = add_rates(clean_df.loc[~clean_df["exclude_from_metrics"]].copy())
+    by_wf = summarize(usable, "workflow")
+    change_date = prompt_change_date(clean_df)
+    pre = usable[usable["date"] < change_date]
+    post = post_change_slice(usable, change_date)
+    pre_wf = summarize(pre, "workflow").set_index("workflow")
+    post_wf = summarize(post, "workflow").set_index("workflow")
 
+    lead = _row(by_wf, "Lead summary")
+    reply = _row(by_wf, "Reply draft")
+    cluster = _row(by_wf, "Feedback clustering")
 
-def missing_expected(rows: list[dict]) -> list[str]:
-    dates = sorted({row["date"] for row in rows})
-    present = {(row["date"], row["team"], row["workflow"], row["source"]) for row in rows}
-    missing = []
-    for date in dates:
-        for team, workflow, source in EXPECTED:
-            if (date, team, workflow, source) not in present:
-                missing.append(f"{date} {team}/{workflow}/{source}")
-    return missing
-
-
-def print_report(path: Path) -> None:
-    raw = load_rows(path)
-    deduped, dup_rows = drop_near_duplicates(raw)
-    demo_rows = [row for row in deduped if row["notes"] == DEMO_NOTE]
-    policy_rows = [row for row in deduped if row["notes"] == POLICY_NOTE]
-    prompt_rows = [row for row in deduped if row["notes"] == PROMPT_NOTE]
-    small_sample_rows = [row for row in raw if row["notes"] == SMALL_SAMPLE_NOTE]
-    na_conf_rows = [row for row in raw if row["confidence_raw"].lower() in NA_TOKENS]
-    missing_rating_rows = [row for row in raw if row["rating"] is None]
-    casing_rows = [row for row in raw if row["team_raw"] != row["team"]]
-
-    # Snapshot: drop near-duplicates and demo traffic; keep the policy-shock row.
-    snapshot = [row for row in deduped if row["notes"] != DEMO_NOTE]
-    # Prompt split: same, but also hold the policy-shock row out of "after".
-    pre = [row for row in snapshot if row["date"] < PROMPT_START]
-    post = [
-        row
-        for row in snapshot
-        if row["date"] >= PROMPT_START and row["notes"] != POLICY_NOTE
+    wf_rows = [
+        [
+            str(r["workflow"]),
+            str(int(r["completed"])),
+            fmt_pct(r["accept_rate"]).strip(),
+            fmt_pct(r["flag_rate"]).strip(),
+        ]
+        for _, r in by_wf.sort_values("accept_rate", ascending=False).iterrows()
     ]
-    dates = sorted({row["date"] for row in raw})
-    workflows = sorted({row["workflow"] for row in snapshot})
-    sources = sorted({row["source"] for row in snapshot})
-    by_workflow = {name: summarize([row for row in snapshot if row["workflow"] == name]) for name in workflows}
-    by_source = {name: summarize([row for row in snapshot if row["source"] == name]) for name in sources}
-    pre_wf = {name: summarize([row for row in pre if row["workflow"] == name]) for name in workflows}
-    post_wf = {name: summarize([row for row in post if row["workflow"] == name]) for name in workflows}
+    wf_table = block_table(["workflow", "completed", "accept", "flag"], wf_rows)
 
-    lead = by_workflow["Lead summary"]
-    reply = by_workflow["Reply draft"]
-    feedback = by_workflow["Feedback clustering"]
-    post_days = sorted({row["date"] for row in post})
-    demo = demo_rows[0]
-    shock = policy_rows[0]
-    shock_stats = summarize(policy_rows)
-    missing = missing_expected(deduped)
+    no_shock = summarize(usable.loc[~usable["policy_shock"]], "workflow")
+    reply_holdout = _row(no_shock, "Reply draft")
 
-    print()
-    print(f"SignalDesk weekly health check | {dates[0]} to {dates[-1]}")
-    print()
-    print(
-        wrap(
-            f"Treat Lead summary as the only workflow that currently looks useful "
-            f"enough to keep investing in. Cleaned accept rate is {pct(lead['accept'])} "
-            f"on {lead['completed']} completed sessions, with a modest flag rate "
-            f"({pct(lead['flag'])}). Reply draft completes often "
-            f"({pct(reply['completion'])}) but users accept less "
-            f"({pct(reply['accept'])}) and flag more ({pct(reply['flag'])}). "
-            f"Feedback clustering is too small ({feedback['sessions']} sessions) "
-            f"to call a winner."
+    lines = []
+    if lead is not None and reply is not None and cluster is not None:
+        holdout_note = ""
+        if reply_holdout is not None:
+            holdout_note = (
+                "   Holding out the Aug 7 policy-shock row does not change "
+                "the ranking: Reply draft would be "
+                f"{fmt_pct(reply_holdout['accept_rate']).strip()} accept on "
+                f"{int(reply_holdout['completed'])} completed, still below "
+                f"Lead summary at {fmt_pct(lead['accept_rate']).strip()}.\n\n"
+            )
+        lines.append(
+            "1. Continue investing in Lead summary. It has the strongest "
+            "evidence of product value: the largest cleaned sample "
+            f"({int(lead['completed'])} completed sessions) with the best "
+            f"accept/flag balance ({fmt_pct(lead['accept_rate']).strip()} vs "
+            f"{fmt_pct(lead['flag_rate']).strip()}).\n\n"
+            f"{wf_table}\n\n"
+            f"{holdout_note}"
+            "   Feedback clustering shows weaker numbers, but its smaller "
+            "sample makes the result less conclusive; we cannot yet "
+            "distinguish a genuinely weaker workflow from normal variance."
         )
-    )
-    print(
-        wrap(
-            f"Do not treat the {PROMPT_START} prompt change as a company-wide win. "
-            f"After dropping demo traffic and only the policy-shock row, "
-            f"accept-rate change is Lead summary "
-            f"{pp_delta(post_wf['Lead summary']['accept'], pre_wf['Lead summary']['accept'])}, "
-            f"Reply draft {pp_delta(post_wf['Reply draft']['accept'], pre_wf['Reply draft']['accept'])}, "
-            f"Feedback clustering {pp_delta(post_wf['Feedback clustering']['accept'], pre_wf['Feedback clustering']['accept'])}. "
-            f"{len(post_days)} cleaned post-change day(s), plus a demo spike in the "
-            f"same week, is not enough to roll the new prompt out more broadly."
+    else:
+        lines.append(
+            "1. Invest in the workflow with the highest accept rate and a "
+            "modest flag rate; do not blend workflows into one company "
+            f"average.\n\n{wf_table}"
         )
-    )
-    print(
-        wrap(
-            f"Investigate Reply draft before any broader rollout. {shock['date']} "
-            f"({shock['source']}, {shock['notes']}) is the strongest warning: "
-            f"{shock['completed']}/{shock['sessions']} completed, accepted "
-            f"{shock['accepted']}, flagged {shock['flagged']} "
-            f"(accept {pct(shock_stats['accept'])}, flag {pct(shock_stats['flag'])}). "
-            f"Model confidence that day was {fmt_num(shock['confidence'], 2)}, which "
-            f"did not track user acceptance. Find out whether the policy got "
-            f"stricter, the new prompt got worse, or both."
+
+    delta_rows = []
+    for wf in sorted(set(pre_wf.index) & set(post_wf.index)):
+        a = pre_wf.loc[wf, "accept_rate"]
+        b = post_wf.loc[wf, "accept_rate"]
+        if pd.isna(a) or pd.isna(b):
+            continue
+        delta_rows.append(
+            [str(wf), fmt_pct(a).strip(), fmt_pct(b).strip(), f"{100 * (b - a):+.1f} pp"]
         )
+    delta_table = (
+        block_table(["workflow", "before", "after", "change"], delta_rows)
+        if delta_rows
+        else "   (no comparable pre/post data)"
     )
-    print(
-        wrap(
-            f"Trust median_confidence and avg_minutes_saved the least. "
-            f"(Feedback clustering {fmt_num(feedback['min_unw'], 1)} min, "
-            f"Lead summary {fmt_num(lead['min_unw'], 1)} min, "
-            f"Reply draft {fmt_num(reply['min_unw'], 1)} min is a task difference, "
-            f"not quality.) Lead summary unweighted minutes-saved moved "
-            f"{post_wf['Lead summary']['min_unw'] - pre_wf['Lead summary']['min_unw']:+.2f} min "
-            f"after the prompt change; ignore that as a win. User rating is thin "
-            f"and got inflated by the demo spike ({fmt_num(demo['rating'], 1)})."
+    lines.append(
+        f"2. Do not roll the {change_date.date()} prompt change out broadly "
+        "yet. Accept-rate effects are small and mixed across workflows:\n\n"
+        f"{delta_table}\n\n"
+        "   The post-change period is short, and the same week contains a "
+        "demo-traffic spike and a review-policy shock — not enough evidence "
+        "to establish a company-wide improvement."
+    )
+
+    shock = add_rates(clean_df.loc[clean_df["policy_shock"]].copy())
+    if not shock.empty:
+        r = shock.iloc[0]
+        typical = usable[
+            (usable["workflow"] == r["workflow"]) & ~usable["policy_shock"]
+        ]
+        anomaly_table = block_table(
+            ["metric", f"typical {r['workflow']}", str(r["date"].date())],
+            [
+                [
+                    "accept rate",
+                    fmt_pct(weighted_rate(typical, "accepted_output", "completed")).strip(),
+                    fmt_pct(r["accept_rate"]).strip(),
+                ],
+                [
+                    "flag rate",
+                    fmt_pct(weighted_rate(typical, "flagged_for_review", "completed")).strip(),
+                    fmt_pct(r["flag_rate"]).strip(),
+                ],
+                [
+                    "confidence",
+                    fmt_num(typical["median_confidence"].median()),
+                    fmt_num(r["median_confidence"]),
+                ],
+                [
+                    "rating",
+                    fmt_num(typical["user_rating"].mean(), 1),
+                    fmt_num(r["user_rating"], 1),
+                ],
+            ],
         )
-    )
-    print(
-        wrap(
-            "Weekly health check going forward: (a) drop near-duplicate export "
-            "rows and any demo/test traffic, (b) report accept_rate and flag_rate "
-            "by workflow — never a blended company average, (c) annotate prompt "
-            "and policy changes on the same chart, (d) page a human if any "
-            "workflow's accept_rate drops more than ~10 pp day-over-day or "
-            "flag_rate doubles."
+        lines.append(
+            f"3. Investigate {r['workflow']} / {r['date'].date()} first. The "
+            f"review policy changed mid-day ({r['source']}), and the day broke "
+            "away from every typical number while model confidence stayed "
+            "high:\n\n"
+            f"{anomaly_table}\n\n"
+            "   Determine whether the deterioration came from the stricter "
+            "policy, the new prompt, or an interaction between the two. "
+            "This is the first "
+            "issue to investigate because the drop is concentrated in one "
+            "day and coincides with a known operational change, making it "
+            "both high-impact and actionable."
         )
+    else:
+        lines.append(
+            "3. Before a broader rollout, inspect the workflow with the highest "
+            "flag rate and any day where accept rate and confidence disagree."
+        )
+
+    demo = clean_df.loc[clean_df["exclude_from_metrics"]]
+    demo_rating = demo["user_rating"].max() if not demo.empty else float("nan")
+    min_by_wf = (
+        {str(k): float(v) for k, v in by_wf.set_index("workflow")["avg_minutes_saved"].items()}
+        if not by_wf.empty
+        else {}
     )
-    print()
-    print("DATA TRUST FLAGS")
-    print(
-        f"{len(na_conf_rows)} row(s) store median_confidence as the text "
-        f"'n/a' (not a real missing value)."
+    min_bits = ", ".join(f"{k} {v:.1f} min" for k, v in min_by_wf.items()) or "n/a"
+    rating_note = (
+        f" and is sensitive to the demo spike ({demo_rating})"
+        if pd.notna(demo_rating)
+        else ""
     )
-    print(f"{len(missing_rating_rows)} row(s) are missing user_rating.")
-    if casing_rows:
-        print("Team name casing is inconsistent ('product' vs title case). Normalized.")
-    print(
-        f"{len(dup_rows)} near-duplicate export row(s) dropped "
-        f"(same date/team/workflow/source/counts)."
+    lines.append(
+        "4. Do not use softer metrics as standalone quality rankings.\n"
+        "   - avg_minutes_saved mainly reflects task complexity, not "
+        f"workflow quality ({min_bits}), and is an unweighted mean of "
+        "daily rows.\n"
+        "   - median_confidence is a diagnostic signal, not a user outcome; "
+        "on the policy-shock day it stayed high while acceptance collapsed.\n"
+        f"   - user_rating is too sparse to be a primary KPI{rating_note}.\n"
+        "   Use accept rate and flag rate as primary health metrics; use "
+        "confidence and rating as secondary diagnostics."
     )
-    print(
-        f"{len(demo_rows)} demo-account spike row excluded "
-        f"({demo['date']} {demo['workflow']} / {demo['source']}: "
-        f"{demo['sessions']} sessions)."
+    lines.append(
+        "5. Weekly monitoring rule going forward:\n"
+        "   (1) remove near-duplicate export rows and demo/test traffic;\n"
+        "   (2) report accept rate and flag rate by workflow — never a "
+        "blended company average;\n"
+        "   (3) annotate prompt and policy changes next to the numbers;\n"
+        "   (4) investigate any accept-rate drop of more than 10 pp "
+        "day-over-day;\n"
+        "   (5) investigate any doubling of flag rate;\n"
+        "   (6) recalibrate these initial thresholds as history accumulates "
+        "(they are not derived from this one week)."
     )
-    print(
-        f"{len(policy_rows)} mid-day review-policy shock "
-        f"({shock['date']} {shock['workflow']} / {shock['source']})."
-    )
-    print(
-        f"New prompt version starts {PROMPT_START} "
-        f"({len(prompt_rows)} annotated rows)."
-    )
-    if missing:
-        print("Incomplete daily coverage: " + "; ".join(missing) + ".")
-    print(
-        f"{len(small_sample_rows)} row(s) are labeled small sample "
-        f"(rates will swing hard)."
-    )
-    print()
-    print("WORKFLOW SNAPSHOT (demo spike + duplicate removed)")
-    print(TABLE_HEADER)
-    for name in workflows:
-        print(table_row(name, by_workflow[name]))
-    print()
-    print("BY SOURCE (same cleaned slice)")
-    print(TABLE_HEADER)
-    for name in sources:
-        print(table_row(name, by_source[name]))
-    print()
-    print(
-        "PROMPT CHANGE SPLIT | "
-        f"pre {dates[0][5:]}..{sorted({row['date'] for row in pre})[-1][5:]} vs "
-        f"post {PROMPT_START[5:]}..{dates[-1][5:]} "
-        "(excludes only the policy-shock row)"
-    )
-    print("Before new prompt")
-    print(TABLE_HEADER)
-    for name in workflows:
-        print(table_row(name, pre_wf[name]))
-    print("After new prompt (cleaned)")
-    print(TABLE_HEADER)
-    for name in workflows:
-        print(table_row(name, post_wf[name]))
-    print()
-    print("POLICY-SHOCK ROW (kept out of the post-prompt table)")
-    print(
-        f"{shock['date']} {shock['workflow']} / {shock['source']}: "
-        f"sessions={shock['sessions']} completed={shock['completed']} "
-        f"accepted={shock['accepted']}"
-    )
-    print(
-        f"flagged={shock['flagged']} complete={pct(shock_stats['completion'])} "
-        f"accept={pct(shock_stats['accept'])} flag={pct(shock_stats['flag'])} "
-        f"confidence={fmt_num(shock['confidence'], 2)} "
-        f"rating={fmt_num(shock['rating'], 1)}"
-    )
-    print()
+    return lines
 
 
-def main() -> int:
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CSV
-    if not path.exists():
-        print(f"CSV not found: {path}", file=sys.stderr)
-        return 1
-    print_report(path)
-    return 0
+def run(path: Path) -> None:
+    raw = load_raw(path)
+    cleaned, quality_flags, context_flags = clean(raw)
+
+    print("=" * 72)
+    print("SignalDesk weekly health check")
+    print(f"Window: {period_label(raw)}  |  source: {path}")
+    print("=" * 72)
+    print()
+    print("This is not a quality scorecard. completed != good output.")
+    print("accepted_output is a rough 'no major rework' signal, not a label.")
+    print("median_confidence is model-reported confidence, not correctness.")
+    print("All rates below use the cleaned slice: near-duplicate export rows")
+    print("and demo traffic removed, policy-shock day kept but shown separately.")
+
+    print()
+    print("WHAT TO DO NEXT")
+    print("---------------")
+    for line in build_recommendation(cleaned):
+        print(line)
+        print()
+
+    print("DATA QUALITY FLAGS (broken records, fixed or dropped)")
+    print("------------------------------------------------------")
+    for i, flag in enumerate(quality_flags, 1):
+        print(f"{i}. {flag}")
+
+    print()
+    print("CONTEXT FLAGS (valid records that change how to read the numbers)")
+    print("------------------------------------------------------------------")
+    for i, flag in enumerate(context_flags, 1):
+        print(f"{i}. {flag}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SignalDesk weekly health check")
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=DEFAULT_DATA,
+        help="Path to product_usage_events.csv",
+    )
+    args = parser.parse_args()
+    if not args.data.exists():
+        raise SystemExit(f"Data file not found: {args.data}")
+    run(args.data)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
