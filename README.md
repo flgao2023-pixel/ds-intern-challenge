@@ -1,49 +1,37 @@
-# Data Science Intern Build Challenge
+# SignalDesk Weekly Health Check
 
-A lightweight build challenge for Data Science Intern candidates to show how they think, build, and work with AI.
+## Track Chosen
 
-This is not a puzzle with one hidden correct answer. It is also not a "don't use AI" exercise. You may use AI as much as you want. The signal is whether you can give it useful context, question its output, and make good decisions in a messy domain.
+Track A: Fictional Domain Packet
 
-## Quick Version
+## What I Built
 
-Target time: 90 minutes. Please stop at 2 hours.
+A stdlib Python CLI that prints a one-page weekly briefing: data-quality flags, a cleaned workflow comparison, a before/after on the Aug 4 prompt change, and one recommended next action.
 
-Pick **one** track:
+```bash
+python3 health_check.py
+```
 
-1. **Fictional Domain Packet**: read [domain-packet.md](domain-packet.md) and use the messy dataset in [sample-data/product_usage_events.csv](sample-data/product_usage_events.csv).
-2. **Bring Your Own Domain**: use a small public or synthetic dataset from a domain you care about.
-3. **Tiny Model / Eval**: use a small model, prompt, heuristic, or evaluation workflow to answer a practical question in a domain you choose.
+## Who It Is For
 
-Build one small useful artifact for a teammate. Acceptable artifacts include:
+The SignalDesk product teammate deciding what is working, what looks suspicious, and whether to roll these workflows out more broadly.
 
-- a short notebook;
-- a small Streamlit app;
-- a simple script with clear output;
-- a lightweight web page;
-- a tiny internal-tool style interface.
+## Data Or Source Used
 
-Please also include:
+`sample-data/product_usage_events.csv` — fictional daily workflow summaries, 2026-08-01 to 2026-08-07. Domain terms are in `domain-packet.md`.
 
-- `README.md`: what you built, who it is for, data/source used, assumptions, issues noticed, and what you would do next;
-- `AI_NOTE.md`: whether/how you used AI, what helped, and what you verified or decided yourself.
+## Assumptions I Made
 
-## What We Care About
+- `accepted_output / completed` is the best available usefulness proxy, not a quality label.
+- `sessions` are workflow runs, not unique users.
+- Workflows should not be averaged together.
+- The Aug 5 demo-account spike (and its duplicate export) should be excluded from metrics.
+- Model `median_confidence` is not correctness.
 
-- Domain digestion: can you understand unfamiliar context quickly?
-- Scope judgment: did you pick something finishable and useful?
-- Data/source judgment: did you notice weirdness without getting stuck?
-- Product sense: would this help a real teammate?
-- Engineering fundamentals: does it run, and is it understandable?
-- AI collaboration: if you used AI, did you use it thoughtfully?
+## Data Issues Or Caveats I Noticed
 
-## What We Do Not Care About
+Duplicate export row; demo traffic mixed into production metrics; `product` vs `Product`; `n/a` stored as confidence; one missing rating; two missing Aug 7 source rows; Support review-policy change that makes Aug 7 incomparable.
 
-- Perfect polish.
-- The most accurate model.
-- A complex app.
-- A long report.
-- Legal-tech knowledge.
-- LeetCode-style cleverness.
-- Spending money on cloud tools.
+## What I Would Do Next With More Time
 
-Read the full prompt in [challenge.md](challenge.md), and choose a track from [tracks.md](tracks.md).
+Filter demo accounts at the source; sample Aug 7 flagged Support replies; wait for one clean week before judging the new prompt.
